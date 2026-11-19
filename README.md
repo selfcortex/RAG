@@ -1,5 +1,9 @@
 # RAG for opencode (Phase 1: MCP only)
 
+> Vector search over the infrastructure docs as an MCP tool the agent calls
+> itself: opencode -> rag-core (MCP) -> Qdrant + CPU bge-m3 embedder.
+> No LLM proxy, no Chatbox, no extra Prometheus/Grafana.
+
 Retrieval stack for the infrastructure documentation corpus, kept as a
 separate repository but attached to the main `llama.cpp` stack through the
 shared external network `ai-net`.
@@ -36,14 +40,17 @@ make ingest  # full rescan of the corpus (patch mode: only changed files)
 make search Q="how does the KV cache restore work"
 ```
 
-Opencode MCP config (`.opencode` or `opencode mcp add`):
+Opencode MCP config (`~/.config/opencode/opencode.json`); the key is read
+from the secrets file at startup, so it never sits in the config:
 
 ```json
 {
-  "mcpServers": {
+  "mcp": {
     "rag": {
+      "type": "remote",
       "url": "http://127.0.0.1:8090/mcp",
-      "headers": { "Authorization": "Bearer <secrets/rag_api_key>" }
+      "enabled": true,
+      "headers": { "Authorization": "Bearer {file:/path/to/RAG/secrets/rag_api_key}" }
     }
   }
 }
@@ -55,7 +62,8 @@ Opencode MCP config (`.opencode` or `opencode mcp add`):
   by paragraph, accumulated to `CHUNK_CHARS` (~2000), with a ~2-3 paragraph
   overlap. Code fences and tables are never split. Each chunk is stored with a
   breadcrumb `path > Section > Subsection` prepended.
-* Point id = `sha256(path + chunk body)`; payload carries `path`, `section`,
+* Point id = `UUID(sha256(path + chunk body)[:16])` (qdrant ids must be UUID
+  or uint64); payload carries `path`, `section`,
   `start_line`, `end_line`, file `hash`, `mtime`, embedder `model`, `dim`.
 * Incremental re-index ("patch"): `state.json` maps path -> mtime/hash. On
   `/ingest` a file is re-chunked only when mtime or hash changed; old points
@@ -72,10 +80,11 @@ including `/mcp`). `qdrant_api_key` is mounted read-only into qdrant.
 ## Monitoring
 
 `rag-core` exposes Prometheus text on `:8090/metrics` (embed/search/ingest
-counters and durations, queue size). To scrape it from the main repo's
-Prometheus, the prometheus container must join `ai-net` and a
-`targets/rag.yml` file_sd entry be added - one line each, done in the main
-repo, not here.
+counters and durations, queue size). The main repo scrapes it: its prometheus
+container joins `ai-net` and has a `job_name: rag` file_sd entry
+(`prometheus/targets/rag.yml`) - no separate Prometheus or Grafana here.
+A `rag` dashboard (status, search rate/latency, ingest counters) is
+provisioned in the main repo's Grafana.
 
 ## Phase 2 (not built yet)
 
