@@ -3,3 +3,6 @@
 secrets/
 __pycache__/
 *.pyc
+
+# Personal postmortem, not for the repo.
+REVIEW.md
