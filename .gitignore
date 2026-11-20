@@ -4,6 +4,4 @@ secrets/
 __pycache__/
 *.pyc
 
-# Personal docs, not for the repo.
-REVIEW.md
-INFRA-MAP.md
+# Personal docs moved to ~/infra-docs (selfcortex/infra-spec).
