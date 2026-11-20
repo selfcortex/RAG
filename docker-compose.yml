@@ -115,6 +115,11 @@ services:
     networks:
       - rag-net
       - ai-net
+      # Reaches Dify's weaviate (service name "weaviate") for the datasets
+      # uploaded through the Dify GUI. External: created by the dify stack.
+      # After `docker compose down` in the dify repo, run:
+      #   docker network connect dify_default rag-core
+      - dify_default
     ports:
       - "127.0.0.1:8090:8090"
     environment:
@@ -128,9 +133,20 @@ services:
       - CHUNK_CHARS=2000
       - STATE_DIR=/state
       - CORPUS_ROOTS=/corpus/ai-compose,/corpus/rag
+      # Unified search: Dify datasets (weaviate) + cross-encoder reranking.
+      # Empty URL disables the store; search degrades to qdrant-only.
+      - WEAVIATE_URL=http://weaviate:8080
+      - WEAVIATE_API_KEY_FILE=/run/secrets/weaviate_api_key
+      - RERANKER_URL=http://reranker:8091
+      - RERANK_API_KEY_FILE=/run/secrets/rerank_api_key
+      - QDRANT_CANDIDATES=20
+      - WEAVIATE_PER_CLASS=10
+      - RERANK_MAX_CANDIDATES=60
     volumes:
       - ./secrets/rag_api_key:/run/secrets/rag_api_key:ro
       - ./secrets/qdrant_api_key:/run/secrets/qdrant_api_key:ro
+      - ./secrets/weaviate_api_key:/run/secrets/weaviate_api_key:ro
+      - ./secrets/rerank_api_key:/run/secrets/rerank_api_key:ro
       - "${CORPUS_AI_COMPOSE:?set CORPUS_AI_COMPOSE in .env}:/corpus/ai-compose:ro"
       - "${CORPUS_RAG:?set CORPUS_RAG in .env}:/corpus/rag:ro"
       - state:/state
@@ -188,6 +204,11 @@ networks:
   ai-net:
     external: true
     name: ai-net
+  # Created by the dify stack (/mnt/GameLinux/dify). rag-core joins it to
+  # search the datasets uploaded through the Dify GUI.
+  dify_default:
+    external: true
+    name: dify_default
 
 volumes:
   qdrant-data:

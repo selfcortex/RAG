@@ -7,8 +7,9 @@ Endpoints:
   GET  /ingest/{job_id} - job status
   POST /mcp             - MCP streamable-HTTP endpoint for opencode
 MCP tools:
-  search(query, collection, k, path)  - vector search, returns chunk text + source
-  list_collections()
+  search(query, k, source, path)      - hybrid search (qdrant + Dify datasets
+                                         in weaviate), re-ranked by rag-reranker
+  list_collections()                  - qdrant collections + dify dataset classes
   get_document(path)                  - full file text from the corpus
 """
 
@@ -27,7 +28,9 @@ from fastapi.responses import PlainTextResponse
 
 from chunker import chunk_id, chunk_markdown
 from embedder import Embedder, EmbedderError, METRICS, render_metrics
+from rerank_client import RerankClient, RerankError
 from store import COLLECTION, Store
+from weaviate_store import WeaviateError, WeaviateStore
 
 # ---------------------------------------------------------------------------
 # config
@@ -45,6 +48,11 @@ CORPUS_ROOTS = [r for r in os.environ.get("CORPUS_ROOTS", "/corpus/ai-compose").
 STATE_DIR = os.environ.get("STATE_DIR", "/state")
 CHUNK_CHARS = int(os.environ.get("CHUNK_CHARS", "2000"))
 EMBED_BATCH = int(os.environ.get("EMBED_BATCH", "16"))
+# Unified search: how many candidates to pull from each store before the
+# reranker picks the final top-k (see unified_search below).
+QDRANT_CANDIDATES = int(os.environ.get("QDRANT_CANDIDATES", "20"))
+WEAVIATE_PER_CLASS = int(os.environ.get("WEAVIATE_PER_CLASS", "10"))
+RERANK_MAX_CANDIDATES = int(os.environ.get("RERANK_MAX_CANDIDATES", "60"))
 STATE_FILE = os.path.join(STATE_DIR, "state.json")  # path -> {hash, mtime}
 
 @asynccontextmanager
@@ -70,12 +78,16 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     if worker_task is not None:
         worker_task.cancel()
     embedder.close()
+    wv.close()
+    reranker.close()
 
 
 app = FastAPI(title="rag-core", lifespan=lifespan)
 
 embedder = Embedder()
 store = Store()
+wv = WeaviateStore()  # Dify datasets; disabled when WEAVIATE_URL is empty
+reranker = RerankClient()  # disabled when RERANKER_URL is empty
 queue: asyncio.Queue[str] = asyncio.Queue()  # job ids
 jobs: dict[str, dict] = {}  # job_id -> status dict
 worker_task: asyncio.Task | None = None
@@ -251,6 +263,56 @@ async def worker() -> None:
 
 
 # ---------------------------------------------------------------------------
+# unified search: qdrant (infra corpus) + weaviate (Dify datasets) -> rerank
+# ---------------------------------------------------------------------------
+
+def _collect_candidates(qvec: list[float], k: int, path: str | None, source: str) -> list[dict]:
+    """Pull near-miss candidates from each store. Weaviate results carry no
+    score (the fork's near-vector endpoint omits it) but are best-first."""
+    cands: list[dict] = []
+    if source in ("all", "qdrant"):
+        for h in store.search(qvec, max(QDRANT_CANDIDATES, k * 4), 0.25, path):
+            cands.append({"source": "qdrant", **h})
+    if source in ("all", "dify") and wv.enabled:
+        for cls in wv.classes():
+            for h in wv.search(cls, qvec, max(WEAVIATE_PER_CLASS, k)):
+                cands.append({"source": "dify", **h})
+    if len(cands) > RERANK_MAX_CANDIDATES:
+        # Cap the rerank batch: keep qdrant whole, then dify in class order.
+        q = [c for c in cands if c["source"] == "qdrant"]
+        d = [c for c in cands if c["source"] == "dify"]
+        cands = q + d[: max(0, RERANK_MAX_CANDIDATES - len(q))]
+    return cands
+
+
+def unified_search(query: str, qvec: list[float], k: int, path: str | None, source: str) -> list[dict]:
+    """Search both stores, then re-rank the union with the cross-encoder.
+    Falls back to per-store top-k (unranked) when the reranker is down."""
+    cands = _collect_candidates(qvec, k, path, source)
+    if not cands:
+        return []
+    if reranker.enabled:
+        try:
+            ranked = reranker.rerank(query, [c["text"] for c in cands], top_n=k)
+            return [
+                {**cands[r["index"]], "score": round(r["score"], 4), "ranked_by": "bge-reranker-v2-m3"}
+                for r in ranked
+            ]
+        except RerankError:
+            pass
+    # Fallback: per-store top-k. qdrant by score; weaviate is already
+    # best-first. Scores from different stores are not comparable, so we
+    # keep them separate instead of merging.
+    hits: list[dict] = []
+    for src in ("qdrant", "dify"):
+        pool = [c for c in cands if c["source"] == src]
+        if src == "qdrant":
+            pool = sorted(pool, key=lambda c: c.get("score") or 0.0, reverse=True)
+        hits.extend(pool[:k])
+    return hits
+
+
+# ---------------------------------------------------------------------------
 # REST API
 # ---------------------------------------------------------------------------
 
@@ -266,19 +328,22 @@ async def metrics() -> str:
 
 @app.post("/search", dependencies=[Depends(require_key)])
 async def search_rest(request: Request) -> dict:
-    """Convenience vector search without the MCP handshake. Same path as the
-    MCP `search` tool: embed the query, query qdrant, return chunk + source."""
+    """Convenience search without the MCP handshake. Same path as the MCP
+    `search` tool: hybrid (qdrant + dify) with reranking."""
     body = await request.json()
     query = body.get("query")
     if not query:
         raise HTTPException(status_code=400, detail="missing 'query'")
     k = int(body.get("k", 5))
+    source = body.get("source", "all")
+    if source not in ("all", "qdrant", "dify"):
+        raise HTTPException(status_code=400, detail=f"unknown source '{source}'")
     path = body.get("path")
     t0 = time.monotonic()
     try:
         qvec = await asyncio.to_thread(embedder.embed, query)
-        hits = await asyncio.to_thread(store.search, qvec, k, 0.25, path)
-    except EmbedderError as e:
+        hits = await asyncio.to_thread(unified_search, query, qvec, k, path, source)
+    except (EmbedderError, WeaviateError) as e:
         raise HTTPException(status_code=502, detail=str(e))
     METRICS["search_total"].inc()
     METRICS["search_seconds_total"].add(time.monotonic() - t0)
@@ -329,19 +394,25 @@ mcp = MCPServer("rag", instructions="Search the infrastructure documentation cor
 
 
 @mcp.tool()
-async def search(query: str, collection: str = COLLECTION, k: int = 5, path: str | None = None) -> list[dict]:
-    """Vector search over the indexed markdown corpus.
-
-    Returns up to k chunks (newest first by score), each with:
-    score, path, section, start_line/end_line, and the chunk text.
-    path filters results to one file (relative to a corpus root)."""
+async def search(
+    query: str, k: int = 5, source: str = "all", path: str | None = None, collection: str = COLLECTION
+) -> list[dict]:
+    """Hybrid search: infra corpus (qdrant) + all Dify datasets (weaviate),
+    re-ranked by bge-reranker-v2-m3. Returns up to k chunks best-first, each
+    with score, source ("qdrant"|"dify"), text, and origin metadata:
+    path/section/lines for qdrant, dataset_id/document_id/chunk_index for
+    dify. source picks one store ("all" default, "qdrant", "dify"); path
+    filters qdrant results to one file. Datasets are uploaded via the Dify
+    GUI; the document name is not indexed - identify it from the text."""
     if collection != COLLECTION:
         return [{"error": f"unknown collection '{collection}', available: {COLLECTION}"}]
+    if source not in ("all", "qdrant", "dify"):
+        return [{"error": f"unknown source '{source}', available: all, qdrant, dify"}]
     t0 = time.monotonic()
     try:
         qvec = await asyncio.to_thread(embedder.embed, query)
-        hits = await asyncio.to_thread(store.search, qvec, k, 0.25, path)
-    except EmbedderError as e:
+        hits = await asyncio.to_thread(unified_search, query, qvec, k, path, source)
+    except (EmbedderError, WeaviateError) as e:
         return [{"error": str(e)}]
     METRICS["search_total"].inc()
     METRICS["search_seconds_total"].add(time.monotonic() - t0)
@@ -349,9 +420,18 @@ async def search(query: str, collection: str = COLLECTION, k: int = 5, path: str
 
 
 @mcp.tool()
-def list_collections() -> list[dict]:
-    """List qdrant collections with point counts and embedder model."""
-    return store.collections()
+def list_collections() -> dict:
+    """List qdrant collections (point counts, embedder model) and the Dify
+    dataset classes available in weaviate."""
+    out: dict = {"collections": store.collections()}
+    if wv.enabled:
+        try:
+            out["dify_datasets"] = wv.classes()
+        except WeaviateError as e:
+            out["dify_datasets"] = f"weaviate error: {e}"
+    else:
+        out["dify_datasets"] = "disabled (WEAVIATE_URL not set)"
+    return out
 
 
 @mcp.tool()
