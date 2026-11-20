@@ -142,6 +142,42 @@ services:
       start_period: 15s
     logging: *default-logging
 
+  # ---------------------------------------------------------------------------
+  # rag-reranker: BAAI/bge-reranker-v2-m3 cross-encoder (CPU) in the /rerank
+  # format expected by Dify's OpenAI-API-compatible provider plugin.
+  # Sits on rag-net (internal); for Dify it must be connected to the
+  # dify_default network with alias "reranker" (same procedure as the
+  # embedder - see runbook). Loopback port 8091 for host-side testing.
+  # ---------------------------------------------------------------------------
+  reranker:
+    build: ./reranker
+    image: reranker:local
+    container_name: rag-reranker
+    restart: unless-stopped
+    networks:
+      - rag-net
+      # A container on an internal network alone cannot publish ports
+      # (verified 2026-11-20); ai-net also carries the Dify connection
+      # procedure's target, so the 127.0.0.1:8091 test port always works.
+      - ai-net
+    ports:
+      - "127.0.0.1:8091:8091"
+    environment:
+      - MODEL_DIR=/model
+      - RERANK_API_KEY_FILE=/run/secrets/rerank_api_key
+      - OMP_NUM_THREADS=6
+    volumes:
+      - ./secrets/rerank_api_key:/run/secrets/rerank_api_key:ro
+      - "${RERANK_MODEL_DIR:?set RERANK_MODEL_DIR in .env}:/model:ro"
+    # start_period covers the ~1.2 GB model load from the host filesystem.
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8091/health', timeout=5)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    logging: *default-logging
+
 networks:
   # Internal: no host/internet access for embedder and qdrant.
   rag-net:
